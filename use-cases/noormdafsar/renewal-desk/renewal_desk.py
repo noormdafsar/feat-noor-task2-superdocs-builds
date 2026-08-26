@@ -470,6 +470,30 @@ def stop_reason(client: Client, max_ops: int) -> str | None:
     return None
 
 
+def _updated_html(out: dict) -> str:
+    """The filled document, treating "absent" and "null" as the same thing.
+
+    The service may answer with document_changes.updated_html set to null when it
+    made no edit. .get(key, "") does not help there -- a default only applies to a
+    missing key, not a present null -- so the None flowed onward and blew up in
+    html.unescape with "argument of type NoneType is not iterable", which names
+    neither the account nor the cause. An empty string is the honest reading:
+    nothing came back, so verification will report the placeholders unfilled.
+    """
+    changes = out.get("document_changes") or {}
+    return changes.get("updated_html") or ""
+
+
+def _why(e: BaseException) -> str:
+    """A failure reason a human can act on.
+
+    SuperDocsError already reads as a sentence. Anything else is a bug here or a
+    response shape we did not expect, and str() alone can be empty -- one such
+    failure recorded itself as "notice: " with nothing after it.
+    """
+    return str(e) if isinstance(e, SuperDocsError) else f"{type(e).__name__}: {e}"
+
+
 def fill_document(client: Client, session_id: str, template_html: str,
                   message: str, must: list[str], tier: str | None,
                   allowed: list[str] | None = None) -> dict:
@@ -480,7 +504,7 @@ def fill_document(client: Client, session_id: str, template_html: str,
     """
     out = client.chat(message, session_id, document_html=template_html,
                       approval_mode="approve_all", model_tier=tier)
-    html = (out.get("document_changes") or {}).get("updated_html", "")
+    html = _updated_html(out)
     problems = verify_fill(html, must, template_html, allowed)
     if not problems:
         return {"html": html}
@@ -490,7 +514,7 @@ def fill_document(client: Client, session_id: str, template_html: str,
         + "\nFix only these. Use the exact values from my previous message."
     )
     out = client.chat(repair, session_id, approval_mode="approve_all", model_tier=tier)
-    html = (out.get("document_changes") or {}).get("updated_html", "")
+    html = _updated_html(out)
     problems = verify_fill(html, must, template_html, allowed)
     if problems:
         raise SuperDocsError("verification failed after one repair: " + "; ".join(problems))
@@ -576,11 +600,16 @@ def _run(args) -> int:
 
                 acct = account_by_id(accounts, d.account_id)
                 nonce = batch_state["nonce"]
+                # A retry needs its own session. Re-sending a fill into the session
+                # that already performed it makes the model answer "nothing to
+                # change" and return a null document -- which is how an interrupted
+                # account failed forever on every later attempt.
+                attempt = int(st.get("attempt", 0)) + 1
                 sessions = {
-                    "quote": f"rd-{batch['renewal_cycle']}-{nonce}-{d.account_id}-quote",
-                    "notice": f"rd-{batch['renewal_cycle']}-{nonce}-{d.account_id}-notice",
+                    "quote": f"rd-{batch['renewal_cycle']}-{nonce}-{d.account_id}-quote-{attempt}",
+                    "notice": f"rd-{batch['renewal_cycle']}-{nonce}-{d.account_id}-notice-{attempt}",
                 }
-                st.update(status="generating", sessions=sessions,
+                st.update(status="generating", attempt=attempt, sessions=sessions,
                           gated=d.gated, gate_reasons=d.gate_reasons,
                           pricing={"old": d.current_price, "new": d.new_price,
                                    "pct": d.change_pct, "direction": d.direction})
@@ -599,8 +628,10 @@ def _run(args) -> int:
                                   q_msg, must_q, tier=None,
                                   allowed=figures_in(q_msg) + must_q)
                     print("       quote filled and verified")
-                except SuperDocsError as e:
-                    st.update(status="failed", fail_reason=f"quote: {e}")
+                except QuotaExhausted:
+                    raise  # a spent quota stops the batch; it is not this account failing
+                except Exception as e:
+                    st.update(status="failed", fail_reason=f"quote: {_why(e)}")
                     settle_ops(st, client)
                     save_acct(d.account_id, st)
                     print(f"       FAILED: {e}")
@@ -609,32 +640,40 @@ def _run(args) -> int:
                 # ---- notice ----
                 n_msg, must_n, allowed_n = notice_message(acct, d, batch)
                 if d.gated:
-                    job_id = client.chat_async(n_msg, sessions["notice"],
-                                               document_html=notice_tpl,
-                                               approval_mode="ask_every_time",
-                                               model_tier="pro")
-                    job = client.wait_for_job(job_id, session_id=sessions["notice"])
-                    if job.get("status") == "awaiting_approval":
-                        changes = parse_pending_changes(
-                            (job.get("metadata") or {}).get("pending_changes"))
-                        st.update(status="awaiting_review", job_id=job_id,
-                                  pending_count=len(changes), must_appear=must_n,
-                              allowed_figures=allowed_n)
-                        print(f"       notice drafted; {len(changes)} proposed change(s) "
-                              f"parked at the human gate")
-                    elif job.get("status") == "completed":
-                        # ask_every_time finished without pausing: the platform gate
-                        # did not engage. Do not trust it -- hold the account anyway.
-                        st.update(status="awaiting_review", job_id=job_id,
-                                  pending_count=0, must_appear=must_n, allowed_figures=allowed_n,
-                                  note="completed without platform pause; held locally")
-                        print("       WARNING: job completed without pausing; "
-                              "account held for human review anyway")
-                    else:
-                        st.update(status="failed",
-                                  fail_reason=f"notice job {job.get('status')}: "
-                                              f"{job.get('error', 'no detail')}")
-                        print(f"       FAILED: notice job {job.get('status')}")
+                    try:
+                        job_id = client.chat_async(n_msg, sessions["notice"],
+                                                   document_html=notice_tpl,
+                                                   approval_mode="ask_every_time",
+                                                   model_tier="pro")
+                        job = client.wait_for_job(job_id, session_id=sessions["notice"])
+                        if job.get("status") == "awaiting_approval":
+                            changes = parse_pending_changes(
+                                (job.get("metadata") or {}).get("pending_changes"))
+                            st.update(status="awaiting_review", job_id=job_id,
+                                      pending_count=len(changes), must_appear=must_n,
+                                  allowed_figures=allowed_n)
+                            print(f"       notice drafted; {len(changes)} proposed change(s) "
+                                  f"parked at the human gate")
+                        elif job.get("status") == "completed":
+                            # ask_every_time finished without pausing: the platform gate
+                            # did not engage. Do not trust it -- hold the account anyway.
+                            st.update(status="awaiting_review", job_id=job_id,
+                                      pending_count=0, must_appear=must_n, allowed_figures=allowed_n,
+                                      note="completed without platform pause; held locally")
+                            print("       WARNING: job completed without pausing; "
+                                  "account held for human review anyway")
+                        else:
+                            st.update(status="failed",
+                                      fail_reason=f"notice job {job.get('status')}: "
+                                                  f"{job.get('error', 'no detail')}")
+                            print(f"       FAILED: notice job {job.get('status')}")
+                    except QuotaExhausted:
+                        raise
+                    except Exception as e:
+                        # A held account is the whole point of this batch, so losing
+                        # one to a transport hiccup must not lose the other nine.
+                        st.update(status="failed", fail_reason=f"notice: {_why(e)}")
+                        print(f"       FAILED: {_why(e)}")
                 else:
                     try:
                         fill_document(client, sessions["notice"], notice_tpl,
@@ -645,8 +684,10 @@ def _run(args) -> int:
                         st.update(status="exported", files=files)
                         print(f"       notice filled and verified; exported: "
                               f"{', '.join(Path(f).name for f in files)}")
-                    except SuperDocsError as e:
-                        st.update(status="failed", fail_reason=f"notice: {e}")
+                    except QuotaExhausted:
+                        raise
+                    except Exception as e:
+                        st.update(status="failed", fail_reason=f"notice: {_why(e)}")
                         print(f"       FAILED: {e}")
 
                 processed += 1
