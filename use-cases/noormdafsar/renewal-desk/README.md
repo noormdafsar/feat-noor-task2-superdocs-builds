@@ -10,6 +10,13 @@ batch reports which accounts it deliberately did not process, and why.
 
 Every account, person, email and figure in `data/` is fabricated.
 
+## Demo
+
+[![Renewal Desk — SuperDocs Round 2 demo](https://img.youtube.com/vi/1mYrkar390M/hqdefault.jpg)](https://youtu.be/1mYrkar390M)
+
+[Watch on YouTube](https://youtu.be/1mYrkar390M) · [copy on Google Drive](https://drive.google.com/file/d/1emNluMiY8ajLE6K-C1kzolFiDbzO8KZv/view?usp=sharing)
+
+
 ---
 
 ## What it does, concretely
